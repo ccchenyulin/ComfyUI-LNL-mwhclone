@@ -2213,6 +2213,16 @@ function updateVideoInputAvailability(node) {
     const hasAudioInput = isInputConnected(node, "audio");
     const previousState = node._lnlUsingImageInput;
     node._lnlUsingImageInput = hasImageInput;
+
+    // 从视频模式切换到 image 模式时清空视频 src，避免旧视频继续显示
+    if (hasImageInput && !previousState && node.previewWidget) {
+        node.previewWidget._videoEl.pause();
+        node.previewWidget._videoEl.removeAttribute("src");
+        node.previewWidget._videoEl.load();
+        node.previewWidget.aspectRatio = 1000;
+        lnl_fitHeight(node);
+    }
+
     if (node.pathWidget) {
         if (!node.pathWidget._lnlHideReady) {
             hideWidgetVisually(node.pathWidget);
@@ -2279,6 +2289,36 @@ function syncImageConnectionState(node) {
         node._lnlLastImagesConnected = connected;
         updateVideoInputAvailability(node);
     }
+}
+
+// show_input_slots toggle: 动态增删 images / audio 输入槽
+function applyInputSlotVisibility(node, show) {
+    if (!node) {
+        return;
+    }
+    const hasImages = node.inputs?.some((i) => i.name === "images");
+    const hasAudio  = node.inputs?.some((i) => i.name === "audio");
+
+    if (show) {
+        // 显示时补全缺失的输入槽
+        if (!hasImages) node.addInput("images", "IMAGE");
+        if (!hasAudio)  node.addInput("audio",  "AUDIO");
+    } else {
+        // 隐藏时按名称反向查找并移除（从后往前避免 index 漂移）
+        for (const name of ["audio", "images"]) {
+            const idx = node.inputs?.findIndex((i) => i.name === name) ?? -1;
+            if (idx === -1) continue;
+            // 断开已有连接
+            const linkId = node.inputs[idx]?.link;
+            if (linkId != null) {
+                node.graph?.removeLink?.(linkId);
+            }
+            node.removeInput(idx);
+        }
+        updateVideoInputAvailability(node);
+    }
+    lnl_fitHeight(node);
+    requestNodeRedraw(node);
 }
 
 // Create widgets
@@ -2390,6 +2430,23 @@ export async function createFrameSelectorWidgets(nodeType) {
             lnl_fitHeight(that);
         }
         normalizePauseTimeoutWidget(this);
+
+        // show_input_slots：初始化时同步一次槽状态，并监听变化
+        const showInputSlotsWidget = this.widgets.find((w) => w.name === "show_input_slots");
+        if (showInputSlotsWidget) {
+            // 初始化：按当前值决定是否显示槽
+            // 用 setTimeout 确保节点 inputs 已经由 ComfyUI 填充完毕
+            setTimeout(() => {
+                applyInputSlotVisibility(this, !!showInputSlotsWidget.value);
+            }, 0);
+
+            const originalShowCallback = showInputSlotsWidget.callback;
+            showInputSlotsWidget.callback = function (value) {
+                originalShowCallback?.apply(this, arguments);
+                applyInputSlotVisibility(that, !!value);
+            };
+        }
+
         updateVideoInputAvailability(this);
         scheduleInputAvailabilitySync(this);
 
@@ -2583,6 +2640,15 @@ export async function createFrameSelectorWidgets(nodeType) {
             lnl_fitHeight(this);
         }
         normalizePauseTimeoutWidget(this);
+
+        // 加载工作流时同步 show_input_slots 状态
+        const showInputSlotsWidget = this.widgets.find((w) => w.name === "show_input_slots");
+        if (showInputSlotsWidget) {
+            setTimeout(() => {
+                applyInputSlotVisibility(this, !!showInputSlotsWidget.value);
+            }, 0);
+        }
+
         updateVideoInputAvailability(this);
         scheduleInputAvailabilitySync(this);
     };

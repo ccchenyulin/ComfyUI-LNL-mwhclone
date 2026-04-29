@@ -232,6 +232,8 @@ def _resize_image_batch_for_preview(images, preview_size):
     return s.movedim(1, -1)
 
 def _save_image_sequence(images, unique_id, progress_callback=None):
+    from tqdm import tqdm
+
     images = _normalize_images(images)
     if images is None:
         return None
@@ -253,15 +255,19 @@ def _save_image_sequence(images, unique_id, progress_callback=None):
         images_np = images_np.astype(np.uint8)
     total_count = int(images_np.shape[0]) if images_np.ndim >= 1 else 0
     step = max(1, total_count // 20) if total_count else 1
-    for idx, frame in enumerate(images_np, start=1):
-        filename = f"{prefix}_{str(idx).zfill(pad)}.png"
-        file_path = os.path.join(target_dir, filename)
-        try:
-            Image.fromarray(frame).save(file_path)
-        except Exception:
-            Image.fromarray(frame[:, :, :3]).save(file_path)
-        if progress_callback and (idx == 1 or idx % step == 0 or idx == total_count):
-            progress_callback(idx, total_count)
+
+    with tqdm(total=total_count, desc="[LNL] 写入预览帧", unit="f", dynamic_ncols=True) as pbar:
+        for idx, frame in enumerate(images_np, start=1):
+            filename = f"{prefix}_{str(idx).zfill(pad)}.png"
+            file_path = os.path.join(target_dir, filename)
+            try:
+                Image.fromarray(frame).save(file_path)
+            except Exception:
+                Image.fromarray(frame[:, :, :3]).save(file_path)
+            pbar.update(1)
+            if progress_callback and (idx == 1 or idx % step == 0 or idx == total_count):
+                progress_callback(idx, total_count)
+
     return {
         "prefix": prefix,
         "count": total_count,
@@ -384,28 +390,38 @@ def _align_audio_to_video(audio, total_duration, trim_start, trim_duration):
     else:
         trimmed = waveform[..., start_samples:end_samples]
     return {"waveform": trimmed, "sample_rate": sample_rate}
+
 def getImageBatch(full_video_path, number_of_frames_to_process, select_every_nth_frame, starting_frame, force_size, custom_width, custom_height):
+    from tqdm import tqdm
+
     generatedImages = lnl_cv_frame_generator(full_video_path, number_of_frames_to_process, starting_frame, select_every_nth_frame)
     (width, height, target_frame_time) = next(generatedImages)
     width = int(width)
     height = int(height)
 
-    imageBatch = torch.from_numpy(np.fromiter(generatedImages, np.dtype((np.float32, (height, width, 3)))))
-    if len(imageBatch) == 0:
+    frames = []
+    with tqdm(total=number_of_frames_to_process, desc="[LNL] 解码帧", unit="f", dynamic_ncols=True) as pbar:
+        for frame in generatedImages:
+            frames.append(frame)
+            pbar.update(1)
+
+    if not frames:
         raise RuntimeError("No frames generated")
+
+    imageBatch = torch.from_numpy(np.array(frames, dtype=np.float32))
 
     if force_size != "Disabled":
         new_size = lnl_target_size(width, height, force_size, custom_width, custom_height)
         if new_size[0] != width or new_size[1] != height:
-            s = imageBatch.movedim(-1,1)
+            s = imageBatch.movedim(-1, 1)
             s = lnl_common_upscale(s, new_size[0], new_size[1], "lanczos", "center")
-            imageBatch = s.movedim(1,-1)
+            imageBatch = s.movedim(1, -1)
 
     return (imageBatch, target_frame_time)
 
 class FrameSelectorV3():
 
-    supported_video_extensions =  ['webm', 'mp4', 'mkv']
+    supported_video_extensions = ['webm', 'mp4', 'mkv']
     force_size_options = [
         "Disabled",
         "Custom Height",
@@ -438,18 +454,57 @@ class FrameSelectorV3():
         default_video_path = files[0] if files else ""
         return {
             "required": {
-                "video_path": ("STRING", {"default": default_video_path}),
-                "force_size": (FrameSelectorV3.force_size_options + FrameSelectorV3.legacy_force_size_options,),
-                "custom_width": ("INT", {"default": 512, "min": 0, "max": 8192, "step": 8}),
-                "custom_height": ("INT", {"default": 512, "min": 0, "max": 8192, "step": 8}),
-                "pause_on_execute": ("BOOLEAN", {"default": False}),
-                "pause_timeout": ("INT", {"default": 1000, "min": 1, "max": 9999999}),
+                "video_path": ("STRING", {
+                    "default": default_video_path,
+                    "tooltip": "视频文件路径（相对于 ComfyUI input 目录）。支持 mp4 / mkv / webm 格式。当连接了 images 输入时此项不生效。",
+                }),
+                "force_size": (FrameSelectorV3.force_size_options + FrameSelectorV3.legacy_force_size_options, {
+                    "tooltip": (
+                        "输出帧的缩放模式。\n"
+                        "Disabled：不缩放，保持原始分辨率；\n"
+                        "Custom Width / Custom Height：按指定宽或高等比缩放；\n"
+                        "Custom：强制缩放为 custom_width × custom_height；\n"
+                        "256x? / ?x256 / 256x256 等：快速预设尺寸。"
+                    ),
+                }),
+                "custom_width": ("INT", {
+                    "default": 512, "min": 0, "max": 8192, "step": 8,
+                    "tooltip": "自定义输出宽度（像素）。仅在 force_size 选择 Custom Width 或 Custom 时生效。",
+                }),
+                "custom_height": ("INT", {
+                    "default": 512, "min": 0, "max": 8192, "step": 8,
+                    "tooltip": "自定义输出高度（像素）。仅在 force_size 选择 Custom Height 或 Custom 时生效。",
+                }),
+                "pause_on_execute": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "启用后，节点执行时将暂停并弹出交互式帧选择器面板，让你手动调整入点、出点、当前帧后再继续执行。",
+                }),
+                "pause_timeout": ("INT", {
+                    "default": 1000, "min": 1, "max": 9999999,
+                    "tooltip": "交互式暂停的最长等待时间（秒）。超时后节点将使用当前参数自动继续执行，不再等待手动确认。",
+                }),
+                # fps 改为节点内 widget，不再需要外部连接
+                "fps": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 240.0, "step": 0.1,
+                    "tooltip": "帧率覆盖值（帧/秒）。设为 0 时自动从视频文件读取实际帧率；大于 0 时强制使用此值覆盖。",
+                }),
+                # toggle：是否显示 images / audio 输入槽
+                "show_input_slots": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "启用后在节点上显示 images 和 audio 输入槽，允许连接外部图像批次和音频源。",
+                }),
             },
             "optional": {
-                "images": ("IMAGE",),
-                "audio": ("AUDIO",),
-                "fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0, "step": 0.1, "forceInput": True}),
-                "graph_id": ("STRING", {"default": ""}),
+                "images": ("IMAGE", {
+                    "tooltip": "可选的图像批次输入。连接后将使用此图像序列替代视频文件作为帧来源，video_path 将不再读取。",
+                }),
+                "audio": ("AUDIO", {
+                    "tooltip": "可选的音频输入。连接后将与输出帧范围对齐裁剪；未连接时节点会自动从视频文件中提取音频。",
+                }),
+                "graph_id": ("STRING", {
+                    "default": "",
+                    "tooltip": "当前工作流图的唯一标识符，用于多工作流场景下的消息路由。通常无需手动填写，留空即可。",
+                }),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -471,9 +526,10 @@ class FrameSelectorV3():
         custom_height,
         pause_on_execute=False,
         pause_timeout=600,
+        fps=0.0,
+        show_input_slots=False,
         images=None,
         audio=None,
-        fps=None,
         graph_id=None,
         prompt=None,
         unique_id=None
@@ -516,7 +572,10 @@ class FrameSelectorV3():
             full_video_path = lnl_fix_path(video_path)
             info_frame_rate, info_total_frames, _ = get_video_info(full_video_path)
             total_frames = _safe_int(info_total_frames, 1)
-            frame_rate = _safe_float(info_frame_rate, 1.0)
+            if _safe_float(fps, 0.0) > 0.0:
+                frame_rate = float(fps)
+            else:
+                frame_rate = _safe_float(info_frame_rate, 1.0)
 
         in_point = _safe_int(prompt_inputs.get("in_point"), _safe_int(slider_data.get("startMarkerFrame"), 1))
         out_point = _safe_int(prompt_inputs.get("out_point"), _safe_int(slider_data.get("endMarkerFrame"), total_frames))
@@ -759,9 +818,10 @@ class FrameSelectorV4(FrameSelectorV3):
         custom_height,
         pause_on_execute=False,
         pause_timeout=600,
+        fps=0.0,
+        show_input_slots=False,
         images=None,
         audio=None,
-        fps=None,
         graph_id=None,
         prompt=None,
         unique_id=None
@@ -773,9 +833,10 @@ class FrameSelectorV4(FrameSelectorV3):
             custom_height,
             pause_on_execute,
             pause_timeout,
+            fps,
+            show_input_slots,
             images,
             audio,
-            fps,
             graph_id,
             prompt,
             unique_id,

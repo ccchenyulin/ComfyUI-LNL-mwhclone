@@ -40,9 +40,11 @@ function computeFrameSelectorSignature(node) {
         in_point: getWidgetValue(node, "in_point", 0),
         out_point: getWidgetValue(node, "out_point", 0),
         select_every_nth_frame: getWidgetValue(node, "select_every_nth_frame", 0),
+        // fps は widget 値で比較（外部接続の有無ではなく実際の値）
+        fps: getWidgetValue(node, "fps", 0),
+        show_input_slots: !!getWidgetValue(node, "show_input_slots", false),
         images_connected: isInputConnected(node, "images"),
         audio_connected: isInputConnected(node, "audio"),
-        fps_connected: isInputConnected(node, "fps"),
     });
 }
 
