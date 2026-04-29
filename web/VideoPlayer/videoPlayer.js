@@ -1574,6 +1574,19 @@ function applyFrameState(node, updates, options = {}) {
         return;
     }
 
+    // fixed_frame_count 模式：当前帧变化时自动锁定 in/out 范围
+    if (options.source === "currentFrame") {
+        const fixedCount = getFixedFrameCount(node);
+        if (fixedCount > 0) {
+            const newIn = nextState.currentFrame;
+            const newOut = Math.min(nextState.totalFrames, nextState.currentFrame + fixedCount - 1);
+            nextState.inPoint = newIn;
+            nextState.outPoint = newOut;
+            nextState._lastChanged = "inPoint";
+            normalizeFrameState(nextState); // 再归一化一次确保边界正确
+        }
+    }
+    
     Object.assign(state, nextState);
 
     if (updates.totalFrames !== undefined) {
@@ -2289,6 +2302,12 @@ function syncImageConnectionState(node) {
         node._lnlLastImagesConnected = connected;
         updateVideoInputAvailability(node);
     }
+}
+
+function getFixedFrameCount(node) {
+    const w = node.widgets?.find((w) => w.name === "fixed_frame_count");
+    const v = Number(w?.value ?? 0);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
 }
 
 // show_input_slots toggle: 动态增删 images / audio 输入槽

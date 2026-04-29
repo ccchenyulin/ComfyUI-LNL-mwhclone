@@ -493,6 +493,10 @@ class FrameSelectorV3():
                     "default": False,
                     "tooltip": "启用后在节点上显示 images 和 audio 输入槽，允许连接外部图像批次和音频源。",
                 }),
+                "fixed_frame_count": ("INT", {
+                    "default": 0, "min": 0, "max": 999999, "step": 1,
+                    "tooltip": "固定片段帧数。设为 0 时禁用；大于 0 时，拖动进度条会自动以当前帧为起点，向后选取该帧数作为出点。",
+                }),
             },
             "optional": {
                 "images": ("IMAGE", {
@@ -528,6 +532,7 @@ class FrameSelectorV3():
         pause_timeout=600,
         fps=0.0,
         show_input_slots=False,
+        fixed_frame_count=0,
         images=None,
         audio=None,
         graph_id=None,
@@ -820,6 +825,7 @@ class FrameSelectorV4(FrameSelectorV3):
         pause_timeout=600,
         fps=0.0,
         show_input_slots=False,
+        fixed_frame_count=0,
         images=None,
         audio=None,
         graph_id=None,
@@ -835,6 +841,7 @@ class FrameSelectorV4(FrameSelectorV3):
             pause_timeout,
             fps,
             show_input_slots,
+            fixed_frame_count,
             images,
             audio,
             graph_id,
