@@ -2448,6 +2448,20 @@ export async function createFrameSelectorWidgets(nodeType) {
             updateCustomSizeLogic(sizeWidget, customWidthWidget, customHeightWidget);
             lnl_fitHeight(that);
         }
+
+        // fixed_frame_count 变化时立即重新应用当前帧的 in/out 范围
+        const fixedFrameCountWidget = this.widgets.find((w) => w.name === "fixed_frame_count");
+        if (fixedFrameCountWidget) {
+            const originalFixedCallback = fixedFrameCountWidget.callback;
+            fixedFrameCountWidget.callback = function (value) {
+                originalFixedCallback?.apply(this, arguments);
+                markNodeNeedsUpdate(that);
+                // 用当前帧重新触发一次 fixed 逻辑
+                const currentFrame = that._lnlFrameState?.currentFrame ?? that.currentFrameWidget?.value ?? 1;
+                applyFrameState(that, { currentFrame }, { source: "currentFrame", force: true });
+            };
+        }
+
         normalizePauseTimeoutWidget(this);
 
         // show_input_slots：初始化时同步一次槽状态，并监听变化
