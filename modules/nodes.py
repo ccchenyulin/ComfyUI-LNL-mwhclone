@@ -12,6 +12,7 @@ from .lnl_pause_messaging import send_and_wait, TimeoutResponse, send_progress
 from .utils import lnl_fix_path
 
 import folder_paths
+from tqdm import tqdm
 
 """
 Attribution: ComfyUI-VideoHelperSuite
@@ -391,10 +392,10 @@ def _align_audio_to_video(audio, total_duration, trim_start, trim_duration):
         trimmed = waveform[..., start_samples:end_samples]
     return {"waveform": trimmed, "sample_rate": sample_rate}
 
-def getImageBatch(full_video_path, number_of_frames_to_process, select_every_nth_frame, starting_frame, force_size, custom_width, custom_height):
+def getImageBatch(full_video_path, number_of_frames_to_process, select_every_nth_frame, starting_frame, force_size, custom_width, custom_height, unique_id=None, graph_id=None):
     from tqdm import tqdm
 
-    generatedImages = lnl_cv_frame_generator(full_video_path, number_of_frames_to_process, starting_frame, select_every_nth_frame)
+    generatedImages = lnl_cv_frame_generator(full_video_path, number_of_frames_to_process, starting_frame, select_every_nth_frame, force_size, custom_width, custom_height)
     (width, height, target_frame_time) = next(generatedImages)
     width = int(width)
     height = int(height)
@@ -408,15 +409,18 @@ def getImageBatch(full_video_path, number_of_frames_to_process, select_every_nth
     if not frames:
         raise RuntimeError("No frames generated")
 
+    tqdm.write("[LNL] 正在转换帧数据...")
     imageBatch = torch.from_numpy(np.array(frames, dtype=np.float32))
 
     if force_size != "Disabled":
         new_size = lnl_target_size(width, height, force_size, custom_width, custom_height)
         if new_size[0] != width or new_size[1] != height:
+            tqdm.write(f"[LNL] 正在调整尺寸至 {new_size[0]}x{new_size[1]}...")
             s = imageBatch.movedim(-1, 1)
             s = lnl_common_upscale(s, new_size[0], new_size[1], "lanczos", "center")
             imageBatch = s.movedim(1, -1)
 
+    tqdm.write("[LNL] 帧处理完成")
     return (imageBatch, target_frame_time)
 
 class FrameSelectorV3():
@@ -777,8 +781,9 @@ class FrameSelectorV3():
         else:
             if pause_on_execute and not pause_completed:
                 send_progress(unique_id, graph_id_value, "Extracting frames...")
-            (current_image, _) = getImageBatch(full_video_path, 1, 1, current_frame - 1, force_size, custom_width, custom_height)
-            (in_out_images, target_frame_time) = getImageBatch(full_video_path, frames_to_process, select_every_nth_frame, starting_frame - 1, force_size, custom_width, custom_height)
+            (current_image, _) = getImageBatch(full_video_path, 1, 1, current_frame - 1, force_size, custom_width, custom_height, unique_id, graph_id_value)
+            tqdm.write(f"[LNL] 正在解码选段 ({frames_to_process} 帧)...")
+            (in_out_images, target_frame_time) = getImageBatch(full_video_path, frames_to_process, select_every_nth_frame, starting_frame - 1, force_size, custom_width, custom_height, unique_id, graph_id_value)
             self.target_frame_time = target_frame_time
 
             if audio is not None:
@@ -788,6 +793,7 @@ class FrameSelectorV3():
             else:
                 if pause_on_execute and not pause_completed:
                     send_progress(unique_id, graph_id_value, "Extracting audio...")
+                tqdm.write("[LNL] 正在提取音频...")
                 audio_value = lnl_lazy_eval(lambda: lnl_get_audio(full_video_path, max(0.0, (starting_frame - 1) * target_frame_time),
                                        frames_to_process*target_frame_time*select_every_nth_frame))
             filename_value = video_path
@@ -832,27 +838,96 @@ class FrameSelectorV4(FrameSelectorV3):
         prompt=None,
         unique_id=None
     ):
-        result = super().process_video(
-            video_path,
-            force_size,
-            custom_width,
-            custom_height,
-            pause_on_execute,
-            pause_timeout,
-            fps,
-            show_input_slots,
-            fixed_frame_count,
-            images,
-            audio,
-            graph_id,
-            prompt,
-            unique_id,
-        )
-        in_point = result[2]
-        frames_to_process = result[5]
-        total_frames = result[6]
-        frame_rate = result[9]
+        # 分别检测下游是否连接了 Current image (index 0) 和 Image Batch (index 1)
+        _needs_current = True
+        _needs_batch = True
+        _str_id = str(unique_id) if unique_id is not None else None
+        if _str_id and isinstance(prompt, dict):
+            _needs_current = False
+            _needs_batch = False
+            for _nid, _ndata in prompt.items():
+                if str(_nid) == _str_id:
+                    continue
+                if isinstance(_ndata, dict):
+                    for _ival in _ndata.get("inputs", {}).values():
+                        if isinstance(_ival, (list, tuple)) and len(_ival) >= 2 and str(_ival[0]) == _str_id:
+                            if _ival[1] == 0:
+                                _needs_current = True
+                            if _ival[1] == 1:
+                                _needs_batch = True
 
+        # 两个 IMAGE 输出都需要 → 走完整解码（现有逻辑，不变）
+        if _needs_current and _needs_batch:
+            result = super().process_video(
+                video_path,
+                force_size,
+                custom_width,
+                custom_height,
+                pause_on_execute,
+                pause_timeout,
+                fps,
+                show_input_slots,
+                fixed_frame_count,
+                images,
+                audio,
+                graph_id,
+                prompt,
+                unique_id,
+            )
+            in_point = result[2]
+            frames_to_process = result[5]
+            total_frames = result[6]
+            frame_rate = result[9]
+
+            prompt_inputs = {}
+            if isinstance(prompt, dict):
+                node_data = prompt.get(str(unique_id)) or prompt.get(unique_id) or {}
+                if isinstance(node_data, dict):
+                    prompt_inputs = node_data.get("inputs") or {}
+            if not isinstance(prompt_inputs, dict):
+                prompt_inputs = {}
+            select_every_nth_frame = _safe_int(prompt_inputs.get("select_every_nth_frame"), 1)
+            if select_every_nth_frame <= 0:
+                select_every_nth_frame = 1
+            graph_id_value = graph_id if graph_id is not None else prompt_inputs.get("graph_id", "")
+            pause_completed = bool(getattr(self, "_lnl_pause_completed", False))
+
+            using_image_batch = _normalize_images(images) is not None
+            trim_start = max(0.0, (in_point - 1) * self.target_frame_time)
+            trim_duration = frames_to_process * self.target_frame_time * select_every_nth_frame
+            total_duration = total_frames * self.target_frame_time
+            if audio is not None:
+                if pause_on_execute and not pause_completed:
+                    send_progress(unique_id, graph_id_value, "Aligning audio...")
+                tqdm.write("[LNL] 正在对齐音频...")
+                audio_value = _align_audio_to_video(audio, total_duration, trim_start, trim_duration)
+            elif using_image_batch:
+                audio_value = _safe_audio_output_dict(_empty_audio_dict())
+            else:
+                if pause_on_execute and not pause_completed:
+                    send_progress(unique_id, graph_id_value, "Extracting audio from video...")
+                tqdm.write("[LNL] 正在从视频提取音频...")
+                full_video_path = lnl_fix_path(video_path)
+                audio_value = lnl_lazy_get_audio(
+                    full_video_path,
+                    trim_start,
+                    trim_duration
+                )
+            tqdm.write("[LNL] 正在处理音频数据...")
+            audio_value = _safe_audio_output_dict(audio_value)
+
+            safe_frame_rate = _safe_float(frame_rate, 0.0)
+            if safe_frame_rate <= 0.0:
+                safe_frame_rate = 30.0 if total_frames else 0.0
+
+            return result[:9] + (int(safe_frame_rate), safe_frame_rate, audio_value,)
+
+        # 一个或两个 IMAGE 输出都不需要 → 快速路径：ffprobe + 按需解码 + 音频
+        if custom_width is None:
+            custom_width = 512
+        if custom_height is None:
+            custom_height = 512
+        force_size = _normalize_force_size(force_size, FrameSelectorV3.force_size_options)
         prompt_inputs = {}
         if isinstance(prompt, dict):
             node_data = prompt.get(str(unique_id)) or prompt.get(unique_id) or {}
@@ -860,36 +935,91 @@ class FrameSelectorV4(FrameSelectorV3):
                 prompt_inputs = node_data.get("inputs") or {}
         if not isinstance(prompt_inputs, dict):
             prompt_inputs = {}
+
+        slider_data = prompt_inputs.get("in_out_point_slider") or {}
+        total_frames = _safe_int(slider_data.get("totalFrames"), 0)
+        frame_rate = _safe_float(slider_data.get("frameRate"), 0.0)
+
+        if not isinstance(video_path, str) or not video_path.strip():
+            raise ValueError("video_path is required")
+        full_video_path = lnl_fix_path(video_path)
+        info_frame_rate, info_total_frames, _ = get_video_info(full_video_path)
+        total_frames = _safe_int(info_total_frames, 1)
+        if _safe_float(fps, 0.0) > 0.0:
+            frame_rate = float(fps)
+        else:
+            frame_rate = _safe_float(info_frame_rate, 1.0)
+
+        in_point = _safe_int(prompt_inputs.get("in_point"), _safe_int(slider_data.get("startMarkerFrame"), 1))
+        out_point = _safe_int(prompt_inputs.get("out_point"), _safe_int(slider_data.get("endMarkerFrame"), total_frames))
+        current_frame = _safe_int(prompt_inputs.get("current_frame"), _safe_int(slider_data.get("currentFrame"), in_point))
+
+        in_point = max(1, min(in_point, total_frames))
+        out_point = max(in_point, min(out_point, total_frames))
+        current_frame = max(1, min(current_frame, total_frames))
+
         select_every_nth_frame = _safe_int(prompt_inputs.get("select_every_nth_frame"), 1)
         if select_every_nth_frame <= 0:
             select_every_nth_frame = 1
-        graph_id_value = graph_id if graph_id is not None else prompt_inputs.get("graph_id", "")
-        pause_completed = bool(getattr(self, "_lnl_pause_completed", False))
 
-        using_image_batch = _normalize_images(images) is not None
+        frames_to_process = out_point - in_point + 1
+        self.target_frame_time = 1.0 / frame_rate if frame_rate else 0.0
+
+        # 按需解码：不需要的输出返回惰性张量，首次访问才触发解码
+        if _needs_current:
+            tqdm.write("[LNL] 解码单帧...")
+            (current_image, _) = getImageBatch(full_video_path, 1, 1, current_frame - 1, force_size, custom_width, custom_height, unique_id, _str_id)
+        else:
+            current_image = LazyImageTensor(
+                (1, 1, 1, 3),
+                lambda: getImageBatch(full_video_path, 1, 1, current_frame - 1, force_size, custom_width, custom_height, unique_id, _str_id)[0],
+                desc="当前帧",
+            )
+
+        if _needs_batch:
+            tqdm.write(f"[LNL] 解码选段 ({frames_to_process} 帧)...")
+            (in_out_images, _) = getImageBatch(full_video_path, frames_to_process, select_every_nth_frame, in_point - 1, force_size, custom_width, custom_height, unique_id, _str_id)
+        else:
+            batch_shape = (max(1, frames_to_process), 1, 1, 3)
+            in_out_images = LazyImageTensor(
+                batch_shape,
+                lambda: getImageBatch(full_video_path, frames_to_process, select_every_nth_frame, in_point - 1, force_size, custom_width, custom_height, unique_id, _str_id)[0],
+                desc=f"批 {frames_to_process} 帧 x{select_every_nth_frame}",
+            )
+
+        # 提取音频（所有快速路径共用）
         trim_start = max(0.0, (in_point - 1) * self.target_frame_time)
         trim_duration = frames_to_process * self.target_frame_time * select_every_nth_frame
         total_duration = total_frames * self.target_frame_time
+
         if audio is not None:
-            if pause_on_execute and not pause_completed:
-                send_progress(unique_id, graph_id_value, "Aligning audio...")
+            tqdm.write("[LNL] 正在对齐音频...")
             audio_value = _align_audio_to_video(audio, total_duration, trim_start, trim_duration)
-        elif using_image_batch:
-            audio_value = _safe_audio_output_dict(_empty_audio_dict())
         else:
-            full_video_path = lnl_fix_path(video_path)
-            audio_value = lnl_lazy_get_audio(
-                full_video_path,
-                trim_start,
-                trim_duration
-            )
+            tqdm.write("[LNL] 正在从视频提取音频...")
+            audio_value = lnl_lazy_get_audio(full_video_path, trim_start, trim_duration)
+
+        tqdm.write("[LNL] 正在处理音频数据...")
         audio_value = _safe_audio_output_dict(audio_value)
 
         safe_frame_rate = _safe_float(frame_rate, 0.0)
         if safe_frame_rate <= 0.0:
             safe_frame_rate = 30.0 if total_frames else 0.0
 
-        return result[:9] + (int(safe_frame_rate), safe_frame_rate, audio_value,)
+        return (
+            current_image,
+            in_out_images,
+            in_point,
+            out_point,
+            video_path,
+            frames_to_process,
+            total_frames,
+            current_frame - in_point + 1,
+            current_frame,
+            int(safe_frame_rate),
+            safe_frame_rate,
+            audio_value,
+        )
 
 NODE_CLASS_MAPPINGS = {
     "LNL_FrameSelectorV4": FrameSelectorV4,

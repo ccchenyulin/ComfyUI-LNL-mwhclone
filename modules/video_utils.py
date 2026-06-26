@@ -218,12 +218,32 @@ class LNLLazyAudioMap(Mapping):
 def lnl_lazy_get_audio(file, start_time=0, duration=0):
     return LNLLazyAudioMap(file, start_time, duration)
 
-def lnl_cv_frame_generator(video, number_of_frames_to_process, skip_first_frames, select_every_nth):
+def lnl_cv_frame_generator(video, number_of_frames_to_process, skip_first_frames, select_every_nth,
+                           force_size="Disabled", custom_width=512, custom_height=512):
+    """
+    Decode video frames using ffmpeg rawvideo pipe (with CUDA HW accel).
+    Supports GPU-side scaling via force_size. Falls back to OpenCV.
+    """
+    # --- ffmpeg pipe (fast) ---
+    if ffmpeg_path is not None:
+        ffprobe_cmd = shutil.which("ffprobe")
+        if ffprobe_cmd is None:
+            ffn = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+            ffprobe_cmd = os.path.join(os.path.dirname(ffmpeg_path), ffn)
+        if ffprobe_cmd and os.path.isfile(ffprobe_cmd):
+            try:
+                yield from _lnl_ffmpeg_pipe(ffmpeg_path, ffprobe_cmd, video,
+                                            number_of_frames_to_process, skip_first_frames, select_every_nth,
+                                            force_size, custom_width, custom_height)
+                return
+            except Exception:
+                pass  # Fallback below
+
+    # --- OpenCV fallback (no GPU-scale) ---
     try:
         video_cap = cv2.VideoCapture(video)
         if not video_cap.isOpened():
             raise ValueError(f"{video} could not be loaded with cv.")
-        # set video_cap to look at start_index frame
         total_frame_count = 0
         total_frames_evaluated = -1
         frames_added = 0
@@ -234,54 +254,176 @@ def lnl_cv_frame_generator(video, number_of_frames_to_process, skip_first_frames
 
         target_frame_time = base_frame_time
         yield (width, height, target_frame_time)
-        
+
         time_offset=target_frame_time - base_frame_time
         while video_cap.isOpened():
             if time_offset < target_frame_time:
                 is_returned = video_cap.grab()
-                # if didn't return frame, video has ended
                 if not is_returned:
                     break
                 time_offset += base_frame_time
             if time_offset < target_frame_time:
                 continue
             time_offset -= target_frame_time
-            # if not at start_index, skip doing anything with frame
             total_frame_count += 1
             if total_frame_count < skip_first_frames:
                 continue
             else:
                 total_frames_evaluated += 1
 
-            # if should not be selected, skip doing anything with frame
             if total_frames_evaluated%select_every_nth != 0:
                 frames_added += 1
                 if total_frame_count >= number_of_frames_to_process + skip_first_frames:
                     break
                 continue
 
-            # opencv loads images in BGR format (yuck), so need to convert to RGB for ComfyUI use
-            # follow up: can videos ever have an alpha channel?
-            # To my testing: No. opencv has no support for alpha
             unused, frame = video_cap.retrieve()
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # convert frame to comfyui's expected format
-            # TODO: frame contains no exif information. Check if opencv2 has already applied
             frame = np.array(frame, dtype=np.float32) / 255.0
             if prev_frame is not None:
                 inp  = yield prev_frame
                 if inp is not None:
-                    #ensure the finally block is called
                     return
             prev_frame = frame
             frames_added += 1
-            # if cap exists and we've reached it, stop processing frames
             if number_of_frames_to_process > 0 and frames_added >= number_of_frames_to_process:
                 break
         if prev_frame is not None:
             yield prev_frame
     finally:
         video_cap.release()
+
+
+def _lnl_ffmpeg_pipe(ffmpeg_cmd, ffprobe_cmd, video,
+                     number_of_frames_to_process, skip_first_frames, select_every_nth,
+                     force_size="Disabled", custom_width=512, custom_height=512):
+    """Decode video via ffmpeg rawvideo pipe (CUDA hwaccel, GPU-scale, batch read)."""
+    import subprocess as sp
+    import time as _time
+    _t0 = _time.time()
+
+    # Probe video dimensions / frame rate
+    probe = sp.run(
+        [ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate",
+         "-of", "json", video],
+        capture_output=True, text=True, timeout=30,
+    )
+    info = json.loads(probe.stdout)
+    stream = info.get("streams", (None,))[0]
+    if stream is None:
+        raise RuntimeError(f"No video stream in {video}")
+
+    src_w = int(stream["width"])
+    src_h = int(stream["height"])
+    rate_str = stream.get("avg_frame_rate") or stream.get("r_frame_rate", "30/1")
+    if "/" in rate_str:
+        num, den = map(float, rate_str.split("/"))
+        fps = num / den if den else 30.0
+    else:
+        fps = float(rate_str) if float(rate_str) > 0 else 30.0
+    target_frame_time = 1.0 / fps
+
+    print(f"[LNL-DEBUG] 视频: {src_w}x{src_h} {fps:.2f}fps, skip_first={skip_first_frames}, nth={select_every_nth}, need={number_of_frames_to_process}")
+
+    # Calculate target size (GPU-side scale to reduce pipe data)
+    target_w, target_h = src_w, src_h
+    if force_size != "Disabled":
+        target_w, target_h = lnl_target_size(src_w, src_h, force_size, custom_width, custom_height)
+        print(f"[LNL-DEBUG] 缩放: {src_w}x{src_h} -> {target_w}x{target_h} (force_size={force_size}, cw={custom_width}, ch={custom_height})")
+    else:
+        print(f"[LNL-DEBUG] 缩放: Disabled, 保持 {src_w}x{src_h}")
+
+    # Yield metadata (scaled dims so caller can skip Python resize)
+    yield (target_w, target_h, target_frame_time)
+
+    frame_size = target_w * target_h * 3
+
+    # Quick CUDA availability check
+    hwaccel_prefix = []
+    try:
+        hwaccel_test = sp.run(
+            [ffmpeg_cmd, "-hwaccels"],
+            capture_output=True, text=True, timeout=5,
+        )
+        cuda_ok = hwaccel_test.returncode == 0 and "cuda" in hwaccel_test.stdout
+        if cuda_ok:
+            hwaccel_prefix = ["-hwaccel", "cuda"]
+        print(f"[LNL-DEBUG] CUDA 检测: {'可用 ✓' if cuda_ok else '不可用 ✗'}")
+    except Exception as e:
+        print(f"[LNL-DEBUG] CUDA 检测异常: {e}")
+
+    # Fast seek + optional GPU-scale
+    seek_ts = skip_first_frames * target_frame_time if skip_first_frames > 0 else 0
+    print(f"[LNL-DEBUG] seek_ts={seek_ts:.4f}s ({skip_first_frames}帧 x {target_frame_time:.4f}s)")
+
+    cmd = [ffmpeg_cmd] + hwaccel_prefix
+    if seek_ts > 0:
+        cmd += ["-ss", str(seek_ts)]
+    cmd += ["-i", video]
+    if target_w != src_w or target_h != src_h:
+        cmd += ["-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black", "-sws_flags", "lanczos"]
+    cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-vsync", "0", "-v", "quiet", "-"]
+
+    print(f"[LNL-DEBUG] ffmpeg 命令: {' '.join(cmd[:8])} ... -f rawvideo ...")
+    _t_popen = _time.time()
+    print(f"[LNL-DEBUG] probe+准备耗时: {_t_popen - _t0:.3f}s")
+
+    proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+
+    BATCH_FRAMES = 32
+    frame_idx = 0
+    frames_added = 0
+    total_bytes = 0
+    _t_first_frame = None
+    _t_batch_start = _time.time()
+
+    try:
+        while True:
+            chunk = proc.stdout.read(frame_size * BATCH_FRAMES)
+            if not chunk:
+                print(f"[LNL-DEBUG] pipe 关闭, 共读取 {total_bytes/1024/1024:.1f}MB, frame_idx={frame_idx}, 产出={frames_added}")
+                break
+
+            chunk_len = len(chunk)
+            total_bytes += chunk_len
+            n_frames_in_chunk = chunk_len // frame_size
+            if _t_first_frame is None:
+                _t_first_frame = _time.time()
+                print(f"[LNL-DEBUG] 首帧到达: {_t_first_frame - _t0:.3f}s (批量 {n_frames_in_chunk} 帧)")
+
+            for offset in range(0, chunk_len, frame_size):
+                raw = chunk[offset:offset + frame_size]
+                if len(raw) < frame_size:
+                    break
+
+                if frame_idx % select_every_nth == 0:
+                    frame = np.frombuffer(raw, np.uint8).reshape((target_h, target_w, 3))
+                    frame = frame.astype(np.float32) / 255.0
+                    inp = yield frame
+                    if inp is not None:
+                        return
+                    frames_added += 1
+                    if number_of_frames_to_process > 0 and frames_added >= number_of_frames_to_process:
+                        break
+                frame_idx += 1
+
+            if number_of_frames_to_process > 0 and frames_added >= number_of_frames_to_process:
+                break
+    finally:
+        _t_end = _time.time()
+        elapsed = _t_end - _t0
+        mb = total_bytes / 1024 / 1024
+        mbps = mb / elapsed if elapsed > 0 else 0
+        fps_effective = frames_added / (elapsed - (_t_first_frame - _t0)) if _t_first_frame and elapsed > (_t_first_frame - _t0) else 0
+        print(f"[LNL-DEBUG] 总计: {elapsed:.3f}s, pipe={mb:.1f}MB ({mbps:.0f}MB/s), "
+              f"frame={target_w}x{target_h}, 产出={frames_added}帧 ({fps_effective:.1f}f/s)")
+        proc.stdout.close()
+        try:
+            proc.wait(timeout=10)
+        except sp.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 def lnl_bislerp(samples, width, height):
     def slerp(b1, b2, r):
@@ -560,3 +702,165 @@ elif len(ffmpeg_paths) == 1:
     ffmpeg_path = ffmpeg_paths[0]
 else:
     ffmpeg_path = max(ffmpeg_paths, key=__lnl_ffmpeg_suitability)
+
+
+class LazyImageTensor:
+    """惰性图像张量：包装解码函数，首次实际访问数据时才触发 ffmpeg 解码。
+
+    可通过 __torch_function__ 协议参与 torch 函数的派发，
+    支持 .shape/.to()/.clone() 等常用张量属性和方法。
+    适合用于"输出已连接但不一定每次都需要"的场景（如 Image Batch）。
+    """
+    def __init__(self, shape, decode_fn, desc=""):
+        self._shape = tuple(shape)
+        self._decode_fn = decode_fn
+        self._desc = desc
+        self._tensor = None
+
+    def _resolve(self):
+        if self._tensor is None:
+            print(f"[LNL] 触发惰性张量解码: {self._desc}")
+            import time as _time
+            _t0 = _time.time()
+            self._tensor = self._decode_fn()
+            _elapsed = _time.time() - _t0
+            print(f"[LNL] 惰性张量解码完成: {_elapsed:.2f}s shape={self._tensor.shape}")
+        return self._tensor
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def dtype(self):
+        return torch.float32
+
+    @property
+    def device(self):
+        return torch.device('cpu')
+
+    @property
+    def ndim(self):
+        return len(self._shape)
+
+    def __len__(self):
+        return self._shape[0]
+
+    def __getitem__(self, key):
+        return self._resolve()[key]
+
+    def __iter__(self):
+        return iter(self._resolve())
+
+    def __contains__(self, item):
+        return item in self._resolve()
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        resolved_args = tuple(
+            a._resolve() if isinstance(a, LazyImageTensor) else a
+            for a in args
+        )
+        resolved_kwargs = {
+            k: v._resolve() if isinstance(v, LazyImageTensor) else v
+            for k, v in kwargs.items()
+        }
+        return func(*resolved_args, **resolved_kwargs)
+
+    # --- 常用张量方法委托 ---
+    def to(self, *args, **kwargs):
+        return self._resolve().to(*args, **kwargs)
+
+    def cpu(self):
+        return self._resolve().cpu()
+
+    def cuda(self, device=None):
+        return self._resolve().cuda(device)
+
+    def clone(self):
+        return self._resolve().clone()
+
+    def detach(self):
+        return self._resolve().detach()
+
+    def contiguous(self):
+        return self._resolve().contiguous()
+
+    def float(self):
+        return self._resolve().float()
+
+    def half(self):
+        return self._resolve().half()
+
+    def double(self):
+        return self._resolve().double()
+
+    def numpy(self):
+        return self._resolve().numpy()
+
+    def view(self, *shape):
+        return self._resolve().view(*shape)
+
+    def reshape(self, *shape):
+        return self._resolve().reshape(*shape)
+
+    def permute(self, *dims):
+        return self._resolve().permute(*dims)
+
+    def unsqueeze(self, dim):
+        return self._resolve().unsqueeze(dim)
+
+    def squeeze(self, dim=None):
+        return self._resolve().squeeze(dim) if dim is not None else self._resolve().squeeze()
+
+    def expand(self, *sizes):
+        return self._resolve().expand(*sizes)
+
+    def repeat(self, *sizes):
+        return self._resolve().repeat(*sizes)
+
+    def size(self, dim=None):
+        return self._resolve().size(dim) if dim is not None else self._resolve().size()
+
+    def numel(self):
+        return self._resolve().numel()
+
+    def mean(self, *args, **kwargs):
+        return self._resolve().mean(*args, **kwargs)
+
+    def sum(self, *args, **kwargs):
+        return self._resolve().sum(*args, **kwargs)
+
+    def min(self, *args, **kwargs):
+        return self._resolve().min(*args, **kwargs)
+
+    def max(self, *args, **kwargs):
+        return self._resolve().max(*args, **kwargs)
+
+    def abs(self):
+        return self._resolve().abs()
+
+    def neg(self):
+        return self._resolve().neg()
+
+    def sqrt(self):
+        return self._resolve().sqrt()
+
+    def type(self, *args, **kwargs):
+        return self._resolve().type(*args, **kwargs)
+
+    def type_as(self, tensor):
+        return self._resolve().type_as(tensor)
+
+    def requires_grad_(self, requires_grad=True):
+        return self._resolve().requires_grad_(requires_grad)
+
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            raise AttributeError(name)
+        return getattr(self._resolve(), name)
+
+    def __repr__(self):
+        status = "resolved" if self._tensor is not None else "lazy"
+        return f"LazyImageTensor(shape={self._shape}, {status}, desc='{self._desc}')"
