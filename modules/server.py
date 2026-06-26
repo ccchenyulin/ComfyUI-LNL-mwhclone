@@ -71,6 +71,22 @@ async def process_video_entry_route(request):
     return web.json_response({"frame_rate": frame_rate, "total_frames": total_frames, "duration": duration})
 
 
+@server.PromptServer.instance.routes.get("/lnl_view_video")
+async def lnl_view_video_route(request):
+    path = request.query.get("path", "")
+    if not path:
+        raise web.HTTPBadText(reason="Missing 'path' parameter")
+
+    fixed_path = lnl_fix_path(path)
+    if not os.path.isfile(fixed_path):
+        raise web.HTTPNotFound(reason="File not found")
+
+    return web.FileResponse(
+        os.path.abspath(fixed_path),
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @server.PromptServer.instance.routes.get("/fetch_groups_data")
 async def fetch_groups_data_route(request):
     try:

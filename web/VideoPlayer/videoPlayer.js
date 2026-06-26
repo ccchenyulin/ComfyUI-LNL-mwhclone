@@ -1230,7 +1230,11 @@ function createVideoPreviewWidget(hostNode) {
             let ar = parseInt(size[0]) / parseInt(size[1])
             params.force_size = target_width + "x" + (target_width / ar)
         }
-        previewWidget.videoEl.src = api.apiURL('/view?' + new URLSearchParams(params));
+        if (params.type === "external") {
+            previewWidget.videoEl.src = api.apiURL('/lnl_view_video?' + new URLSearchParams({path: params.filename}));
+        } else {
+            previewWidget.videoEl.src = api.apiURL('/view?' + new URLSearchParams(params));
+        }
         this.videoEl.hidden = false;
     }
 
@@ -2306,6 +2310,9 @@ function syncImageConnectionState(node) {
 
 function getFixedFrameCount(node) {
     const w = node.widgets?.find((w) => w.name === "fixed_frame_count");
+    if (w && (!Number.isFinite(Number(w.value)) || w.value === undefined || w.value === null)) {
+        w.value = 0;
+    }
     const v = Number(w?.value ?? 0);
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
 }
@@ -2404,7 +2411,14 @@ export async function createFrameSelectorWidgets(nodeType) {
                 that.previewWidget.updateParameters({});
                 return;
             }
-            
+
+            if (value.startsWith("/")) {
+                let extIdx = value.lastIndexOf(".");
+                let format = "video/" + value.slice(extIdx + 1);
+                that.previewWidget.updateParameters({filename: value, type: "external", format: format});
+                return;
+            }
+
             let extension_index = value.lastIndexOf(".");
             let extension = value.slice(extension_index+1);
             let format = "video"

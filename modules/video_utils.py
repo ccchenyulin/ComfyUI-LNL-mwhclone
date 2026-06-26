@@ -434,8 +434,7 @@ def get_video_info(video_path):
     if ffprobe_cmd is not None:
         cmd = [
             ffprobe_cmd, '-v', 'error', '-select_streams', 'v:0',
-            '-count_frames',
-            '-show_entries', 'stream=avg_frame_rate,r_frame_rate,nb_frames,nb_read_frames,duration',
+            '-show_entries', 'stream=avg_frame_rate,r_frame_rate,nb_frames,duration',
             '-show_entries', 'format=duration',
             '-of', 'json',
             full_video_path,
