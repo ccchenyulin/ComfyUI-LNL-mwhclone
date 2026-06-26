@@ -354,7 +354,15 @@ function createTimelineWidget(hostNode) {
         outMarkerEl.style.left = `${outPct}%`;
         currentMarkerEl.style.left = `${currentPct}%`;
 
-        labelEl.textContent = `Frame: ${currentFrame} / ${totalFrames}`;
+        const fps = state.frameRate || 30;
+        const currSec = (currentFrame - 1) / fps;
+        const totalSec = Math.max(totalFrames - 1, 1) / fps;
+        const fmt = (t) => {
+            const m = Math.floor(t / 60);
+            const s = t % 60;
+            return `${String(m).padStart(2, '0')}:${s.toFixed(2).padStart(5, '0')}`;
+        };
+        labelEl.textContent = `Frame: ${currentFrame} / ${totalFrames}  ${fmt(currSec)} / ${fmt(totalSec)}`;
     };
 
     const updateFromPointer = (event) => {
@@ -808,6 +816,31 @@ function createVideoPreviewWidget(hostNode) {
     previewWidget.imageEl.style.pointerEvents = "none";
     previewWidget.parentEl.appendChild(previewWidget.imageEl);
     previewWidget.parentEl.appendChild(previewWidget._videoEl);
+
+    // FPS overlay (top-left of preview)
+    previewWidget.fpsEl = document.createElement("span");
+    previewWidget.fpsEl.style.cssText =
+        "position:absolute;top:4px;left:4px;color:#fff;font-size:13px;"
+        + "font-family:monospace;background:rgba(0,0,0,.55);padding:1px 5px;"
+        + "border-radius:3px;pointer-events:none;z-index:10;display:none;";
+    previewWidget.parentEl.appendChild(previewWidget.fpsEl);
+
+    previewWidget.updateFpsDisplay = function () {
+        const p = this.value?.params;
+        if (!p) { this.fpsEl.style.display = "none"; return; }
+        let fps = p.frameRate;
+        if (!fps && p.frameDuration && p.frameDuration > 0) {
+            fps = Math.round(1 / p.frameDuration * 100) / 100;
+        }
+        if (fps && fps > 0) {
+            this.fpsEl.textContent = fps % 1 === 0 ? fps + " FPS" : fps.toFixed(2) + " FPS";
+            this.fpsEl.style.display = "";
+        } else {
+            this.fpsEl.textContent = "-- FPS";
+            this.fpsEl.style.display = "";
+        }
+    };
+
     previewWidget.audioEl = document.createElement("audio");
     previewWidget.audioEl.preload = "auto";
     previewWidget.audioEl.crossOrigin = "anonymous";
@@ -1250,6 +1283,7 @@ function createVideoPreviewWidget(hostNode) {
         }
         Object.assign(previewWidget.value.params, params || {});
         previewWidget.updateSource();
+        previewWidget.updateFpsDisplay();
         const shouldUseVideoAudio = !hostNode?._lnlUsingImageInput && !isInputConnected(hostNode, "audio");
         previewWidget._useVideoAudio = shouldUseVideoAudio;
         if (shouldUseVideoAudio) {
@@ -1609,6 +1643,7 @@ function applyFrameState(node, updates, options = {}) {
         }
         if (updates.frameRate) {
             node.previewWidget.value.params.frameRate = state.frameRate;
+            node.previewWidget.updateFpsDisplay?.();
         }
     }
 
